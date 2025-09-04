@@ -1,93 +1,164 @@
 import hashlib
 import secrets
 import base64
+import random
 from typing import Tuple
 
-class NovelEncryption:
-    def __init__(self):
-        self.seed = secrets.token_bytes(32)
-        
-    def _generate_key(self, message: str, salt: bytes) -> bytes:
-        combined = (message.encode() + self.seed + salt).hex().encode()
-        key = hashlib.shake_256(combined).digest(32)
-        return key
-        
-    def _custom_transform(self, data: bytes, key: bytes) -> bytes:
-        pattern = [key[i % len(key)] for i in range(len(data))]
-        transformed = bytearray()
-        for i, byte in enumerate(data):
-            xor_result = byte ^ pattern[i]
-            permuted = ((xor_result << 3) | (xor_result >> 5)) & 0xFF
-            transformed.append(permuted)
-        return bytes(transformed)
-        
-    def _reverse_transform(self, data: bytes, key: bytes) -> bytes:
-        pattern = [key[i % len(key)] for i in range(len(data))]
-        reversed_data = bytearray()
-        for i, byte in enumerate(data):
-            unpermuted = ((byte << 5) | (byte >> 3)) & 0xFF
-            xor_result = unpermuted ^ pattern[i]
-            reversed_data.append(xor_result)
-        return bytes(reversed_data)
-        
-    def encrypt(self, message: str, password: str) -> Tuple[str, str]:
-        salt = secrets.token_bytes(16)
-        key = self._generate_key(password, salt)
-        message_bytes = message.encode('utf-8')
-        encrypted_data = self._custom_transform(message_bytes, key)
-        encoded_data = base64.b64encode(encrypted_data).decode('utf-8')
-        return encoded_data, base64.b64encode(salt).decode('utf-8')
-        
-    def decrypt(self, encrypted_message: str, salt: str, password: str) -> str:
-        salt_bytes = base64.b64decode(salt.encode('utf-8'))
-        key = self._generate_key(password, salt_bytes)
-        encrypted_data = base64.b64decode(encrypted_message.encode('utf-8'))
-        decrypted_data = self._reverse_transform(encrypted_data, key)
-        return decrypted_data.decode('utf-8')
+class NovaCrypt:
+    """
+    A class for a novel multi-layered encryption scheme.
+    """
 
-if __name__ == "__main__":
-    encryptor = NovelEncryption()
-    
-    # Prompt user to choose between encrypt or decrypt
+    def __init__(self, password: str, salt: bytes):
+        """
+        Initializes the NovaCrypt instance.
+
+        Args:
+            password (str): The user's password.
+            salt (bytes): A random salt.
+        """
+        self.password = password
+        self.salt = salt
+        self.key = self._derive_key()
+
+    def _derive_key(self) -> bytes:
+        """Derives a 32-byte key from the password and salt using PBKDF2."""
+        return hashlib.pbkdf2_hmac('sha256', self.password.encode('utf-8'), self.salt, 100000, dklen=32)
+
+    def _generate_s_box(self) -> Tuple[list, list]:
+        """Generates a key-dependent substitution box (S-box) and its inverse."""
+        s_box = list(range(256))
+        # Use the key to seed the random number generator for a deterministic shuffle
+        random.seed(self.key)
+        random.shuffle(s_box)
+        
+        # Create the inverse S-box for decryption
+        inv_s_box = [0] * 256
+        for i, val in enumerate(s_box):
+            inv_s_box[val] = i
+            
+        return s_box, inv_s_box
+
+    def _substitute(self, data: bytes, s_box: list) -> bytes:
+        """Substitutes bytes using the S-box."""
+        return bytes([s_box[b] for b in data])
+
+    def _xor_with_key(self, data: bytes) -> bytes:
+        """Performs a repeating-key XOR operation on the data."""
+        return bytes([data[i] ^ self.key[i % len(self.key)] for i in range(len(data))])
+
+    def encrypt(self, message: str) -> str:
+        """
+        Encrypts a message using a multi-layered approach.
+
+        The process is:
+        1. Encode the message to bytes.
+        2. XOR the data with the derived key.
+        3. Substitute each byte using a key-dependent S-box.
+
+        Args:
+            message (str): The plaintext message to encrypt.
+
+        Returns:
+            str: The Base64 encoded encrypted message.
+        """
+        s_box, _ = self._generate_s_box()
+        message_bytes = message.encode('utf-8')
+        
+        # Layer 1: XOR
+        xor_data = self._xor_with_key(message_bytes)
+        
+        # Layer 2: Substitution
+        substituted_data = self._substitute(xor_data, s_box)
+        
+        return base64.b64encode(substituted_data).decode('utf-8')
+
+    def decrypt(self, encrypted_message: str) -> str:
+        """
+        Decrypts a message by reversing the encryption process.
+
+        The process is:
+        1. Decode the Base64 encrypted message.
+        2. Reverse the substitution using an inverse S-box.
+        3. Reverse the XOR operation.
+        4. Decode the bytes back to a string.
+
+        Args:
+            encrypted_message (str): The Base64 encoded encrypted message.
+
+        Returns:
+            str: The decrypted plaintext message.
+        """
+        _, inv_s_box = self._generate_s_box()
+        encrypted_data = base64.b64decode(encrypted_message)
+        
+        # Reverse Layer 2: Substitution
+        unsubstituted_data = self._substitute(encrypted_data, inv_s_box)
+        
+        # Reverse Layer 1: XOR
+        decrypted_bytes = self._xor_with_key(unsubstituted_data)
+        
+        return decrypted_bytes.decode('utf-8')
+
+def main():
+    """Main function to run the encryption/decryption tool."""
     choice = input("Encrypt or Decrypt? (e/d): ").strip().lower()
-    
+
     if choice == 'e':
-        # Encrypt mode
         message = input("Enter the message to encrypt: ")
-        password = input("Enter the password: ")
+        password = input("Enter a password: ")
         
-        print("\nOriginal message:", message)
-        print("Password:", password)
+        salt = secrets.token_bytes(16)
+        encryptor = NovaCrypt(password, salt)
         
-        encrypted_msg, salt = encryptor.encrypt(message, password)
-        print("\nEncrypted message:", encrypted_msg)
-        print("Salt used:", salt)
+        encrypted_msg = encryptor.encrypt(message)
         
-        # Save to a file in the same directory
+        # Combine salt and encrypted message for storage
+        # The format is salt(base64) + ":" + encrypted_message(base64)
+        salt_b64 = base64.b64encode(salt).decode('utf-8')
+        output_message = f"{salt_b64}:{encrypted_msg}"
+        
+        print("\n--- Encryption Successful ---")
+        print(f"Encrypted Output (save this securely):\n{output_message}")
+        
         with open('encrypted_message.txt', 'w') as f:
-            f.write(f"Encrypted Message: {encrypted_msg}\nSalt: {salt}")
-        
-        print("\nEncrypted message saved to 'encrypted_message.txt'")
-    
+            f.write(output_message)
+        print("\nOutput saved to 'encrypted_message.txt'")
+
     elif choice == 'd':
-        # Decrypt mode
         try:
-            # Read encrypted message and salt from file
-            with open('encrypted_message.txt', 'r') as f:
-                lines = f.readlines()
-                encrypted_msg = lines[0].split(": ")[1].strip()
-                salt = lines[1].split(": ")[1].strip()
-        
+            encrypted_input = input("Enter the encrypted message (or press Enter to read from file): ").strip()
+            if not encrypted_input:
+                with open('encrypted_message.txt', 'r') as f:
+                    encrypted_input = f.read().strip()
+                print("Read encrypted message from 'encrypted_message.txt'")
+
             password = input("Enter the password to decrypt: ")
             
-            # Decrypt the message
-            decrypted_msg = encryptor.decrypt(encrypted_msg, salt, password)
-            print("\nDecrypted message:", decrypted_msg)
-            print("Decryption successful:", "Yes" if decrypted_msg else "No")
-        
+            # Split the input to get the salt and the encrypted message
+            parts = encrypted_input.split(':')
+            if len(parts) != 2:
+                raise ValueError("Invalid encrypted message format.")
+                
+            salt_b64, encrypted_msg = parts
+            salt = base64.b64decode(salt_b64)
+            
+            decryptor = NovaCrypt(password, salt)
+            decrypted_msg = decryptor.decrypt(encrypted_msg)
+            
+            print("\n--- Decryption Successful ---")
+            print("Decrypted message:", decrypted_msg)
+
         except FileNotFoundError:
-            print("Error: 'encrypted_message.txt' not found. Please encrypt first.")
+            print("\nError: 'encrypted_message.txt' not found and no input provided.")
+        except (ValueError, IndexError, base64.binascii.Error) as e:
+            print(f"\nAn error occurred during decryption: Invalid data. ({e})")
+            print("This could be due to an incorrect password or corrupted message.")
         except Exception as e:
-            print("An error occurred during decryption:", str(e))
+            print(f"\nAn unexpected error occurred: {e}")
+    
     else:
         print("Invalid choice. Please enter 'e' for encrypt or 'd' for decrypt.")
+
+if __name__ == "__main__":
+    main()
