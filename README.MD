@@ -1,7 +1,7 @@
 # NovaCrypt: A Hybrid Post-Quantum Encryption Tool
 
 ## Overview
-NovaCrypt is a command-line encryption tool written in Python. It implements a novel hybrid encryption scheme designed to be resistant to attacks from both classical and future quantum computers. It combines a lattice-based Key Encapsulation Mechanism (KEM) with a robust, multi-round symmetric cipher.
+NovaCrypt is a command-line encryption tool written in Python. It implements a hybrid encryption scheme designed to be resistant to attacks from both classical and future quantum computers. It combines a lattice-based Key Encapsulation Mechanism (KEM) with a robust, multi-round symmetric cipher.
 
 This tool is designed for educational purposes to demonstrate the principles of building a post-quantum, password-based encryption system.
 

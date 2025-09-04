@@ -6,7 +6,7 @@ from typing import Tuple
 
 class NovaCrypt:
     """
-    A class for a novel hybrid post-quantum encryption scheme.
+    A class for a hybrid post-quantum encryption scheme.
     It combines a lattice-based key encapsulation mechanism (LWE-KEM)
     with a multi-round symmetric cipher. The PQC keypair is derived
     deterministically from the user's password.
