@@ -1,66 +1,77 @@
-# Novel Encryption Tool
+# NovaCrypt: A Hybrid Post-Quantum Encryption Tool
 
 ## Overview
-This repository contains a **Python** implementation of a novel encryption algorithm that combines multiple cryptographic primitives (substitution cipher, key-stream XOR, permutation, and non-linear mixing) to provide a highly resistant encryption scheme. It is intentionally designed to be *hard to break* with standard cryptanalysis techniques, though it is not formally proven secure.
+NovaCrypt is a command-line encryption tool written in Python. It implements a novel hybrid encryption scheme designed to be resistant to attacks from both classical and future quantum computers. It combines a lattice-based Key Encapsulation Mechanism (KEM) with a robust, multi-round symmetric cipher.
+
+This tool is designed for educational purposes to demonstrate the principles of building a post-quantum, password-based encryption system.
 
 ## Features
-- **Dynamic substitution cipher** generated from the encryption key
-- **Hash-based key stream** (SHA-256 with counter) for XOR masking
-- **Permutation layer** derived from a random IV and key hash
-- **Non-linear mixing** with the key hash to thwart linear attacks
-- Easy-to-use API with clear `encrypt()` and `decrypt()` methods
-- Works with arbitrary-length UTF-8 text
+- **Hybrid Post-Quantum & Symmetric Encryption:** Uses a hybrid model to ensure security against multiple threat vectors.
+- **Lattice-Based KEM:** The key exchange is based on the **Learning with Errors (LWE)** problem, which is believed to be resistant to quantum computer attacks.
+- **Robust Symmetric Cipher:** A custom 16-round cipher using key-dependent S-boxes and round-specific keys for strong symmetric encryption.
+- **Strong Key Derivation:** Uses PBKDF2 with **600,000 iterations** to derive cryptographic keys from a user's password, making it highly resistant to brute-force attacks.
+- **File and Message Support:** Can encrypt and decrypt both simple text messages and entire files of any type.
+
+## Dependencies
+- Python 3.x
+- NumPy
 
 ## Installation
-This project only relies on Python's standard library. No external dependencies are required.
+1.  Clone the repository:
+    ```bash
+    git clone https://github.com/tou2/novacrypt.git
+    cd novacrypt
+    ```
+
+2.  Install the required dependency:
+    ```bash
+    pip install numpy
+    ```
+
+## How to Use
+The tool runs from the command line.
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/novel-encryption.git
-cd novel-encryption
-
-# (Optional) Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate      # On Windows: .\.venv\Scripts\activate
+python main.py
 ```
 
-## Usage
-```python
-from novel_encryption import NovelEncryption
+You will be prompted to choose whether to **Encrypt** or **Decrypt**, and whether you are working with a **message** or a **file**.
 
-# Create an instance with a secret key
-key = "my_secret_key_12345"
-crypto = NovelEncryption(key)
+### Example: Encrypting a File
+1.  Run `python main.py`.
+2.  Choose `e` for Encrypt.
+3.  Choose `f` for File.
+4.  Enter the path to your file (e.g., `my_document.pdf`).
+5.  Enter a strong password.
+6.  The tool will create an encrypted file (e.g., `my_document.pdf.nc`).
 
-# Encrypt a message
-message = "Hello, world!"
-encrypted, iv = crypto.encrypt(message)
-print("Encrypted:", encrypted)
-print("IV:", iv)
+### Example: Decrypting a File
+1.  Run `python main.py`.
+2.  Choose `d` for Decrypt.
+3.  Choose `f` for File.
+4.  Enter the path to the encrypted file (e.g., `my_document.pdf.nc`).
+5.  Enter the same password you used to encrypt.
+6.  The tool will decrypt the file and suggest saving it as the original filename (e.g., `my_document.pdf`).
 
-# Decrypt the message
-original = crypto.decrypt(encrypted, iv)
-print("Original:", original)
-```
+## How It Works
+NovaCrypt uses a sophisticated, multi-stage process to protect your data.
 
-## API Reference
-### `NovelEncryption(key: str | None = None)`
-- **key**: Encryption key. If omitted, a random 32-byte key is generated.
+### Encryption
+1.  **PQC Key Generation:** A unique salt is generated. This salt and your password are put through PBKDF2 to deterministically generate a quantum-resistant public/private key pair for the LWE scheme.
+2.  **Key Encapsulation:** A new, single-use 256-bit symmetric key is generated. This key is then "encapsulated" (encrypted) using the PQC public key.
+3.  **Symmetric Encryption:** The actual message or file data is encrypted using the 16-round symmetric cipher, which is keyed by the encapsulated symmetric key.
+4.  **Packaging:** The salt, the encapsulated symmetric key, and the encrypted data are all Base64-encoded and combined into a single output string for storage.
 
-### `encrypt(message: str) -> Tuple[str, str]`
-- **message**: Plain-text string to encrypt
-- **Returns**: A tuple `(ciphertext_hex, iv_hex)`
-
-### `decrypt(ciphertext_hex: str, iv_hex: str) -> str`
-- **ciphertext_hex**: Hex string produced by `encrypt`
-- **iv_hex**: IV hex string produced by `encrypt`
-- **Returns**: The original plain-text string
+### Decryption
+1.  **Unpacking:** The encrypted string is split into its components (salt, encapsulated key, and encrypted data).
+2.  **PQC Key Re-generation:** The salt and your password are used to re-generate the exact same PQC private key.
+3.  **Key Decapsulation:** The PQC private key is used to "decapsulate" (decrypt) the symmetric key.
+4.  **Symmetric Decryption:** The symmetric key is then used to decrypt the main payload, restoring the original message or file.
 
 ## Security Considerations
-- The algorithm is *experimental* and not formally vetted
-- Key management is critical: use a secure, random key and keep it confidential
-- The IV is random for each encryption; it should be stored/transmitted alongside the ciphertext
-- Do **not** reuse keys or IVs for multiple messages
+- This is an **experimental and educational** implementation. It has not undergone a formal security audit.
+- The security of the entire system relies on the strength of your password and the presumed hardness of the Learning with Errors (LWE) problem.
+- Always use a strong, unique password for encryption.
 
 ## License
 This project is released under the MIT License.
@@ -68,4 +79,3 @@ This project is released under the MIT License.
 ---
 
 For more details or to contribute, feel free to open issues or pull requests!
-```
