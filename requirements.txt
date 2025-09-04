@@ -1,0 +1,3 @@
+cryptography>=42.0.0
+argon2-cffi>=23.1.0 ; extra == "argon2"
+python-oqs ; extra == "pq"

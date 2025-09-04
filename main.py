@@ -1,304 +1,421 @@
-import hashlib
-import secrets
+import os
+import json
 import base64
-import numpy as np
-from typing import Tuple
+import secrets
+from typing import Optional, Tuple, Dict, Any
 
-class NovaCrypt:
+# External (optional) dependencies:
+# - cryptography (required) for AEAD and KDFs
+# - argon2-cffi (optional) for Argon2id KDF
+# - oqs (optional) for Kyber (post-quantum KEM)
+# Hardening additions: Ed25519 signing for envelope integrity & identity.
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+except ImportError as e:
+    raise SystemExit("Missing required dependency 'cryptography'. Install with: pip install cryptography")
+
+try:
+    import argon2.low_level as argon2_ll
+    HAVE_ARGON2 = True
+except ImportError:
+    HAVE_ARGON2 = False
+
+try:
+    import oqs  # python-oqs wrapper for liboqs (Kyber, etc.)
+    HAVE_OQS = True
+except ImportError:
+    HAVE_OQS = False
+
+KEY_DIR = os.path.join(os.path.expanduser('~'), '.novacrypt')
+ED25519_PRIV_PATH = os.path.join(KEY_DIR, 'ed25519_private.pem')
+ED25519_PUB_PATH = os.path.join(KEY_DIR, 'ed25519_public.pem')
+
+# Kyber key storage
+KYBER_PUB_PATH = os.path.join(KEY_DIR, 'kyber768_public.bin')
+KYBER_SK_PATH  = os.path.join(KEY_DIR, 'kyber768_secret.enc')
+
+KYBER_KEM_NAME = 'Kyber768'
+KYBER_SK_WRAP_INFO = b'kyber-sk-wrap-v1'
+
+# --------------------------- Utility Helpers --------------------------- #
+
+def b64e(data: bytes) -> str:
+    return base64.b64encode(data).decode('utf-8')
+
+def b64d(text: str) -> bytes:
+    return base64.b64decode(text.encode('utf-8'))
+
+# --------------------------- Key Derivation --------------------------- #
+
+def derive_password_key(password: str, salt: bytes, length: int = 32) -> Tuple[bytes, Dict[str, Any]]:
+    """Derive a key from a password using Argon2id (if available) else Scrypt.
+    Returns (key, kdf_metadata)."""
+    password_bytes = password.encode('utf-8')
+    if HAVE_ARGON2:
+        # Parameters chosen for interactive use; adjust (memory cost) upward if needed.
+        t_cost = 3
+        m_cost_kib = 64 * 1024  # 64 MiB
+        parallelism = 1
+        key = argon2_ll.hash_secret_raw(password_bytes, salt, t_cost, m_cost_kib, parallelism, length, argon2_ll.Type.ID)
+        meta = {
+            'alg': 'argon2id',
+            't_cost': t_cost,
+            'm_cost_kib': m_cost_kib,
+            'parallelism': parallelism,
+            'salt': b64e(salt)
+        }
+        return key, meta
+    # Fallback: Scrypt (still strong; increase N for higher security)
+    kdf = Scrypt(salt=salt, length=length, n=2**15, r=8, p=1)
+    key = kdf.derive(password_bytes)
+    meta = {
+        'alg': 'scrypt',
+        'n': 2**15,
+        'r': 8,
+        'p': 1,
+        'salt': b64e(salt)
+    }
+    return key, meta
+
+# --------------------------- Post-Quantum (Optional) --------------------------- #
+
+def _load_or_create_kyber_keys(password: str) -> Optional[Tuple[bytes, bytes]]:
+    """Create (if needed) and load a persistent Kyber768 keypair.
+    Secret key stored AES-GCM encrypted with a key derived from password + static context.
+    Returns (public_key, secret_key) or None if oqs unavailable.
     """
-    A class for a hybrid post-quantum encryption scheme.
-    It combines a lattice-based key encapsulation mechanism (LWE-KEM)
-    with a multi-round symmetric cipher. The PQC keypair is derived
-    deterministically from the user's password.
-    """
-    N = 256
-    Q = 7681
-    STD_DEV = 2.25
-    ROUNDS = 16
-    ITERATIONS = 600000
+    if not HAVE_OQS:
+        return None
+    ensure_key_dir()
+    # Derive KEK for wrapping the secret key (independent of per-message salt)
+    kek_salt = b'NC-KYBER-KEYWRAP'
+    # Re-use Scrypt fallback/Argon2 via derive_password_key but we need deterministic KEK
+    kek, _ = derive_password_key(password, kek_salt[:16], length=32)
 
-    def __init__(self, password: str):
-        self.password = password.encode('utf-8')
+    if os.path.isfile(KYBER_PUB_PATH) and os.path.isfile(KYBER_SK_PATH):
+        # Load public key
+        with open(KYBER_PUB_PATH, 'rb') as f:
+            pub = f.read()
+        # Unwrap secret key
+        with open(KYBER_SK_PATH, 'rb') as f:
+            blob = f.read()
+        try:
+            nonce = blob[:12]
+            ct = blob[12:]
+            sk = AESGCM(kek).decrypt(nonce, ct, KYBER_SK_WRAP_INFO)
+            return pub, sk
+        except Exception:
+            # Corrupted or wrong password
+            raise ValueError("Failed to decrypt stored Kyber secret key (wrong password or corruption).")
+    # Need to create
+    import oqs
+    with oqs.KeyEncapsulation(KYBER_KEM_NAME) as kem:
+        pub = kem.generate_keypair()
+        sk = kem.export_secret_key()
+    with open(KYBER_PUB_PATH, 'wb') as f:
+        f.write(pub)
+    nonce = secrets.token_bytes(12)
+    ct = AESGCM(kek).encrypt(nonce, sk, KYBER_SK_WRAP_INFO)
+    with open(KYBER_SK_PATH, 'wb') as f:
+        f.write(nonce + ct)
+    return pub, sk
 
-    def _generate_deterministic_lwe_keypair(self, salt: bytes) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]:
-        """Deterministically generates a PQC keypair from the password and a salt."""
-        # Use PBKDF2 to generate a large seed for all our random numbers
-        seed_material = hashlib.pbkdf2_hmac('sha256', self.password, salt, self.ITERATIONS, dklen=128)
-        
-        # Seed the numpy random generator
-        rng = np.random.RandomState(int.from_bytes(seed_material[:4], 'little'))
-        
-        # Generate components from the seed
-        A = rng.randint(0, self.Q, size=(self.N, self.N))
-        s = rng.randint(0, self.Q, size=self.N)
-        e = np.round(rng.normal(0, self.STD_DEV, size=self.N)).astype(int)
-        b = (A @ s + e) % self.Q
-        
-        return (A, b), s
+def pq_encapsulate(public_key: bytes) -> Tuple[Dict[str, str], bytes]:
+    """Encapsulate shared secret to given Kyber public key."""
+    import oqs
+    with oqs.KeyEncapsulation(KYBER_KEM_NAME, public_key=public_key) as kem:
+        ct, shared = kem.encap_secret()
+    return {
+        'alg': KYBER_KEM_NAME,
+        'ciphertext': b64e(ct)
+    }, shared
 
-    def _encapsulate_secret(self, public_key: Tuple[np.ndarray, np.ndarray]) -> Tuple[Tuple[np.ndarray, int], bytes]:
-        """Uses the public key to encapsulate a shared secret."""
-        A, b = public_key
-        r = np.random.randint(0, self.Q, size=self.N)
-        e1 = np.round(np.random.normal(0, self.STD_DEV, size=self.N)).astype(int)
-        e2 = np.round(np.random.normal(0, self.STD_DEV))
+def pq_decapsulate(ciphertext_b64: str, secret_key: bytes) -> bytes:
+    """Decapsulate shared secret using stored Kyber secret key."""
+    import oqs
+    ct = b64d(ciphertext_b64)
+    with oqs.KeyEncapsulation(KYBER_KEM_NAME, secret_key=secret_key) as kem:
+        shared = kem.decap_secret(ct)
+    return shared
 
-        u = (A @ r + e1) % self.Q # Corrected: Removed transpose from A
-        v = (b @ r + e2 + (self.Q // 2)) % self.Q
+# --------------------------- Hybrid Key Assembly --------------------------- #
 
-        # The shared secret k is derived from v
-        k_binary = (v > self.Q // 4) & (v < 3 * self.Q // 4)
-        k = hashlib.sha256(k_binary.tobytes()).digest()
-        return (u, v), k
+def combine_keys(*parts: bytes, length: int = 32) -> bytes:
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=length, salt=None, info=b'NovaCrypt-Hybrid')
+    return hkdf.derive(b''.join(parts))
 
-    def _decapsulate_secret(self, private_key: np.ndarray, ciphertext: Tuple[np.ndarray, int]) -> bytes:
-        """Uses the private key to decapsulate the shared secret."""
-        u, v = ciphertext
-        s = private_key
-        recovered_v = (v - u @ s) % self.Q # Corrected: Changed matrix multiplication order
-        
-        k_binary = (recovered_v > self.Q // 4) & (recovered_v < 3 * self.Q // 4)
-        k = hashlib.sha256(k_binary.tobytes()).digest()
-        return k
+# --------------------------- Ed25519 Key Management --------------------------- #
 
-    def _get_round_key(self, main_key: bytes, round_number: int) -> bytes:
-        return hashlib.sha256(main_key + bytes([round_number])).digest()
+def ensure_key_dir():
+    if not os.path.isdir(KEY_DIR):
+        os.makedirs(KEY_DIR, exist_ok=True)
 
-    def _generate_s_boxes(self, key: bytes) -> Tuple[list, list]:
-        s_box = list(range(256))
-        seed_material = hashlib.sha256(key).digest()
-        # Use a different random stream for S-box generation, seeded with the first 4 bytes of the hash
-        rng = np.random.RandomState(int.from_bytes(seed_material[:4], 'little'))
-        rng.shuffle(s_box)
-        
-        inv_s_box = [0] * 256
-        for i, val in enumerate(s_box):
-            inv_s_box[val] = i
-        return s_box, inv_s_box
-
-    def _substitute(self, data: bytes, s_box: list) -> bytes:
-        return bytes([s_box[b] for b in data])
-
-    def _xor_with_key(self, data: bytes, key: bytes) -> bytes:
-        return bytes([data[i] ^ key[i % len(key)] for i in range(len(data))])
-
-    def _symmetric_cipher(self, data: bytes, key: bytes, s_box: list, decrypt=False) -> bytes:
-        """Unified symmetric cipher function."""
-        rounds = reversed(range(self.ROUNDS)) if decrypt else range(self.ROUNDS)
-        # The s_box argument is the inverse s_box when decrypting
-        for i in rounds:
-            round_key = self._get_round_key(key, i)
-            if decrypt:
-                # Reverse the operations in the opposite order
-                data = self._substitute(data, s_box) # 1. Inverse substitute
-                data = self._xor_with_key(data, round_key) # 2. XOR
-            else:
-                # Encrypt
-                data = self._xor_with_key(data, round_key) # 1. XOR
-                data = self._substitute(data, s_box) # 2. Substitute
-        return data
-
-    def encrypt_bytes(self, data: bytes) -> str:
-        """
-        Encrypts raw bytes using the hybrid post-quantum scheme.
-
-        Args:
-            data (bytes): The raw bytes to encrypt.
-
-        Returns:
-            str: A string containing the complete encrypted data, ready for storage.
-        """
-        # 1. Generate a salt to ensure the PQC keypair is unique for each encryption.
-        pqc_salt = secrets.token_bytes(16)
-        
-        # 2. Deterministically generate the PQC keypair from the password and salt.
-        public_key, _ = self._generate_deterministic_lwe_keypair(pqc_salt)
-        
-        # 3. Encapsulate a new, random secret (the symmetric key).
-        lwe_ciphertext, symmetric_key = self._encapsulate_secret(public_key)
-        
-        # 4. Generate S-boxes for the symmetric cipher.
-        s_box, _ = self._generate_s_boxes(symmetric_key)
-        
-        # 5. Encrypt the message using the symmetric cipher.
-        encrypted_payload = self._symmetric_cipher(data, symmetric_key, s_box)
-        
-        # 6. Package everything for output.
-        pqc_salt_b64 = base64.b64encode(pqc_salt).decode('utf-8')
-        lwe_u_b64 = base64.b64encode(lwe_ciphertext[0].tobytes()).decode('utf-8')
-        lwe_v_b64 = base64.b64encode(np.array([lwe_ciphertext[1]]).tobytes()).decode('utf-8')
-        payload_b64 = base64.b64encode(encrypted_payload).decode('utf-8')
-        
-        return f"{pqc_salt_b64}:{lwe_u_b64}:{lwe_v_b64}:{payload_b64}"
-
-    def encrypt(self, message: str) -> str:
-        """Encrypts a message string using the hybrid post-quantum scheme."""
-        return self.encrypt_bytes(message.encode('utf-8'))
-
-    def decrypt_bytes(self, encrypted_message: str) -> bytes:
-        """
-        Decrypts a full encrypted message string into raw bytes.
-
-        Args:
-            encrypted_message (str): The complete encrypted data string.
-
-        Returns:
-            bytes: The original raw bytes.
-        """
-        # 1. Unpack the encrypted message.
-        parts = encrypted_message.split(':')
-        if len(parts) != 4:
-            raise ValueError("Invalid encrypted message format.")
-        pqc_salt_b64, lwe_u_b64, lwe_v_b64, payload_b64 = parts
-        
-        pqc_salt = base64.b64decode(pqc_salt_b64)
-        lwe_u = np.frombuffer(base64.b64decode(lwe_u_b64), dtype=int)
-        lwe_v = np.frombuffer(base64.b64decode(lwe_v_b64), dtype=int)[0]
-        lwe_ciphertext = (lwe_u, lwe_v)
-        encrypted_payload = base64.b64decode(payload_b64)
-        
-        # 2. Re-generate the same PQC private key using the password and salt.
-        _, private_key = self._generate_deterministic_lwe_keypair(pqc_salt)
-        
-        # 3. Decapsulate the secret (the symmetric key) using the private key.
-        symmetric_key = self._decapsulate_secret(private_key, lwe_ciphertext)
-        
-        # 4. Re-generate the same S-boxes.
-        _, inv_s_box = self._generate_s_boxes(symmetric_key)
-        
-        # 5. Decrypt the payload.
-        decrypted_bytes = self._symmetric_cipher(encrypted_payload, symmetric_key, inv_s_box, decrypt=True)
-        
-        return decrypted_bytes
-
-    def decrypt(self, encrypted_message: str) -> str:
-        """Decrypts a message by reversing the hybrid post-quantum scheme."""
-        decrypted_bytes = self.decrypt_bytes(encrypted_message)
-        return decrypted_bytes.decode('utf-8')
-
-def main():
-    """Main function to run the encryption/decryption tool."""
-    # Ensure numpy is installed
-    try:
-        import numpy
-    except ImportError:
-        print("Error: NumPy is required for this script.")
-        print("Please install it by running: pip install numpy")
-        return
-
-    choice = input("Encrypt or Decrypt? (e/d): ").strip().lower()
-
-    if choice == 'e':
-        mode = input("Encrypt a (m)essage or a (f)ile? ").strip().lower()
-        password = input("Enter a password: ")
-        encryptor = NovaCrypt(password)
-
-        if mode == 'm':
-            message = input("Enter the message to encrypt: ")
-            encrypted_msg = encryptor.encrypt(message)
-            
-            print("\n--- Encryption Successful ---")
-            print(f"Encrypted Output (save this securely):\n{encrypted_msg}")
-            
-            with open('encrypted_message.txt', 'w') as f:
-                f.write(encrypted_msg)
-            print("\nOutput saved to 'encrypted_message.txt'")
-        
-        elif mode == 'f':
-            try:
-                input_file = input("Enter the path to the file to encrypt: ")
-                output_file = input(f"Enter the output path for the encrypted file (default: {input_file}.nc): ")
-                if not output_file:
-                    output_file = f"{input_file}.nc"
-
-                print(f"Reading file: {input_file}...")
-                with open(input_file, 'rb') as f:
-                    file_bytes = f.read()
-                
-                print("Encrypting file...")
-                encrypted_data = encryptor.encrypt_bytes(file_bytes)
-
-                with open(output_file, 'w') as f:
-                    f.write(encrypted_data)
-                
-                print("\n--- File Encryption Successful ---")
-                print(f"File encrypted and saved to: {output_file}")
-
-            except FileNotFoundError:
-                print(f"\nError: Input file not found at '{input_file}'")
-            except Exception as e:
-                print(f"\nAn unexpected error occurred during file encryption: {e}")
-        
-        else:
-            print("Invalid mode. Please choose 'm' or 'f'.")
-
-    elif choice == 'd':
-        mode = input("Decrypt a (m)essage or a (f)ile? ").strip().lower()
-        password = input("Enter the password to decrypt: ")
-        decryptor = NovaCrypt(password)
-
-        if mode == 'm':
-            try:
-                encrypted_input = input("Enter the encrypted message (or press Enter to read from file): ").strip()
-                if not encrypted_input:
-                    with open('encrypted_message.txt', 'r') as f:
-                        encrypted_input = f.read().strip()
-                    print("Read encrypted message from 'encrypted_message.txt'")
-                
-                decrypted_msg = decryptor.decrypt(encrypted_input)
-                
-                print("\n--- Decryption Successful ---")
-                print("Decrypted message:", decrypted_msg)
-
-            except FileNotFoundError:
-                print("\nError: 'encrypted_message.txt' not found and no input provided.")
-            except (ValueError, IndexError, base64.binascii.Error) as e:
-                print(f"\nAn error occurred during decryption: Invalid data. ({e})")
-                print("This could be due to an incorrect password or corrupted message.")
-            except Exception as e:
-                print(f"\nAn unexpected error occurred: {e}")
-
-        elif mode == 'f':
-            try:
-                input_file = input("Enter the path to the encrypted file (e.g., 'myfile.txt.nc'): ")
-                # Suggest an output file by removing the .nc extension if it exists
-                default_output = input_file[:-3] if input_file.endswith('.nc') else ""
-                output_file = input(f"Enter the output path for the decrypted file (default: {default_output}): ")
-                if not output_file:
-                    if default_output:
-                        output_file = default_output
-                    else:
-                        # If no default could be determined, ask again.
-                        print("Output path cannot be empty.")
-                        output_file = input("Enter the output path for the decrypted file: ")
-
-
-                print(f"Reading encrypted file: {input_file}...")
-                with open(input_file, 'r') as f:
-                    encrypted_data = f.read()
-                
-                print("Decrypting file...")
-                decrypted_bytes = decryptor.decrypt_bytes(encrypted_data)
-
-                with open(output_file, 'wb') as f:
-                    f.write(decrypted_bytes)
-                
-                print("\n--- File Decryption Successful ---")
-                print(f"File decrypted and saved to: {output_file}")
-
-            except FileNotFoundError:
-                print(f"\nError: Input file not found at '{input_file}'")
-            except (ValueError, IndexError, base64.binascii.Error) as e:
-                print(f"\nAn error occurred during decryption: Invalid data. ({e})")
-                print("This could be due to an incorrect password or corrupted message.")
-            except Exception as e:
-                print(f"\nAn unexpected error occurred during file decryption: {e}")
-        
-        else:
-            print("Invalid mode. Please choose 'm' or 'f'.")
-    
+def load_or_create_ed25519(password: str) -> Tuple[ed25519.Ed25519PrivateKey, bytes]:
+    """Load (or create) a persistent Ed25519 key pair. Private key is password-encrypted on disk."""
+    ensure_key_dir()
+    if os.path.isfile(ED25519_PRIV_PATH):
+        with open(ED25519_PRIV_PATH, 'rb') as f:
+            priv = serialization.load_pem_private_key(f.read(), password=password.encode('utf-8'))
     else:
-        print("Invalid choice. Please enter 'e' for encrypt or 'd' for decrypt.")
+        priv = ed25519.Ed25519PrivateKey.generate()
+        pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.BestAvailableEncryption(password.encode('utf-8'))
+        )
+        with open(ED25519_PRIV_PATH, 'wb') as f:
+            f.write(pem)
+        pub_pem = priv.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        with open(ED25519_PUB_PATH, 'wb') as f:
+            f.write(pub_pem)
+    pub_bytes = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    return priv, pub_bytes
 
-if __name__ == "__main__":
-    main()
+# --------------------------- Core Class --------------------------- #
+class NovaCrypt:
+    """Hybrid (optionally post-quantum assisted) authenticated encryption wrapper with optional envelope signing.
+
+    Design: 
+      1. Generate random 32-byte data key (DK) per encryption.
+      2. Encrypt payload with ChaCha20-Poly1305 (AEAD) using DK.
+      3. Derive KEK from password (Argon2id or Scrypt) + salt.
+      4. Optionally include Kyber768 shared secret (if oqs installed) -> hybrid secret.
+      5. Wrap DK with AES-GCM under derived hybrid KEK.
+      6. (Optional) Sign canonical envelope body with Ed25519.
+      7. Output structured JSON then base64.
+    """
+
+    VERSION = 3  # bumped: signature envelope format
+
+    def __init__(self, password: str, sign: bool = True):
+        self.password = password
+        self.sign = sign
+        self._signing_key: Optional[ed25519.Ed25519PrivateKey] = None
+        self._signing_pub: Optional[bytes] = None
+        if self.sign:
+            try:
+                self._signing_key, self._signing_pub = load_or_create_ed25519(password)
+            except Exception:
+                # Fallback: disable signing if key load fails
+                self.sign = False
+
+    def _canonical_json(self, obj: Dict[str, Any]) -> bytes:
+        return json.dumps(obj, separators=(',', ':'), sort_keys=True).encode('utf-8')
+
+    # -------------------- Encryption -------------------- #
+    def encrypt_bytes(self, data: bytes, use_pq: bool = True) -> str:
+        salt = secrets.token_bytes(16)
+        pw_key, kdf_meta = derive_password_key(self.password, salt)
+
+        pq_meta = None
+        pq_secret = b''
+        if use_pq and HAVE_OQS:
+            try:
+                kyber_keys = _load_or_create_kyber_keys(self.password)
+                if kyber_keys:
+                    pub, _ = kyber_keys
+                    pq_meta, pq_secret = pq_encapsulate(pub)
+                else:
+                    use_pq = False
+            except Exception:
+                use_pq = False  # fallback silently to password-only
+        hybrid_kek_material = combine_keys(pw_key, pq_secret)
+
+        # Data key (random per message)
+        data_key = secrets.token_bytes(32)
+
+        # Encrypt payload with ChaCha20-Poly1305
+        payload_nonce = secrets.token_bytes(12)
+        aead_payload = ChaCha20Poly1305(data_key)
+        ciphertext = aead_payload.encrypt(payload_nonce, data, b'payload')
+
+        # Wrap data key with AES-GCM
+        wrap_nonce = secrets.token_bytes(12)
+        wrapper = AESGCM(hybrid_kek_material)
+        wrapped_key = wrapper.encrypt(wrap_nonce, data_key, b'datakey')
+
+        # BEGIN REPLACED ENVELOPE LOGIC
+        body = {
+            'v': self.VERSION,
+            'mode': 'hybrid-pq' if (use_pq and pq_meta) else 'password-only',
+            'kdf': kdf_meta,
+            'pq': pq_meta,  # contains ciphertext only
+            'wrap': {
+                'alg': 'AESGCM',
+                'nonce': b64e(wrap_nonce),
+                'ct': b64e(wrapped_key)
+            },
+            'data': {
+                'alg': 'ChaCha20Poly1305',
+                'nonce': b64e(payload_nonce),
+                'ct': b64e(ciphertext)
+            }
+        }
+        if self.sign and self._signing_key is not None and self._signing_pub is not None:
+            sig = self._signing_key.sign(self._canonical_json(body))
+            envelope = {
+                'sig_alg': 'ed25519',
+                'sig_pub': b64e(self._signing_pub),
+                'sig': b64e(sig),
+                'body': body
+            }
+        else:
+            envelope = body  # unsigned legacy-compatible
+        json_bytes = json.dumps(envelope, separators=(',', ':')).encode('utf-8')
+        return b64e(json_bytes)
+        # END REPLACED ENVELOPE LOGIC
+
+    def encrypt(self, message: str, use_pq: bool = True) -> str:
+        return self.encrypt_bytes(message.encode('utf-8'), use_pq=use_pq)
+
+    # -------------------- Decryption -------------------- #
+    def decrypt_bytes(self, blob: str) -> bytes:
+        raw = b64d(blob)
+        try:
+            top = json.loads(raw.decode('utf-8'))
+        except Exception as e:
+            raise ValueError(f'Malformed envelope: {e}')
+
+        if 'body' in top and 'sig' in top:
+            body = top.get('body')
+            if body.get('v') != self.VERSION:
+                raise ValueError('Unsupported version')
+            if self.sign:
+                try:
+                    sig_pub = b64d(top['sig_pub'])
+                    signature = b64d(top['sig'])
+                    ed25519.Ed25519PublicKey.from_public_bytes(sig_pub).verify(signature, self._canonical_json(body))
+                except Exception as e:
+                    raise ValueError(f'Signature verification failed: {e}')
+            envelope = body
+        else:
+            envelope = top
+            if envelope.get('v') != self.VERSION:
+                raise ValueError('Unsupported version')
+
+        kdf_meta = envelope['kdf']
+        salt = b64d(kdf_meta['salt'])
+        pw_key, _ = derive_password_key(self.password, salt)
+
+        pq_secret = b''
+        pq_meta = envelope.get('pq')
+        if pq_meta and pq_meta.get('ciphertext') and envelope.get('mode') == 'hybrid-pq':
+            if not HAVE_OQS:
+                raise ValueError('PQ ciphertext present but oqs not installed')
+            try:
+                _, sk = _load_or_create_kyber_keys(self.password)
+                pq_secret = pq_decapsulate(pq_meta['ciphertext'], sk)
+            except Exception as e:
+                raise ValueError(f'PQ decapsulation failed: {e}')
+
+        hybrid_kek_material = combine_keys(pw_key, pq_secret)
+
+        wrap = envelope['wrap']
+        data_section = envelope['data']
+        wrap_nonce = b64d(wrap['nonce'])
+        wrapped_key = b64d(wrap['ct'])
+        try:
+            data_key = AESGCM(hybrid_kek_material).decrypt(wrap_nonce, wrapped_key, b'datakey')
+        except Exception:
+            raise ValueError('Key unwrap failed (password/PQ mismatch or corruption)')
+        payload_nonce = b64d(data_section['nonce'])
+        ciphertext = b64d(data_section['ct'])
+        try:
+            plaintext = ChaCha20Poly1305(data_key).decrypt(payload_nonce, ciphertext, b'payload')
+        except Exception:
+            raise ValueError('Payload authentication failed (corrupted or tampered)')
+        return plaintext
+        # END UPDATED PARSING
+
+# --------------------------- CLI Interface --------------------------- #
+
+def prompt_bool(msg: str, default: bool = True) -> bool:
+    dv = 'Y/n' if default else 'y/N'
+    ans = input(f"{msg} ({dv}): ").strip().lower()
+    if not ans:
+        return default
+    return ans.startswith('y')
+
+def run_cli():
+    print('NovaCrypt Hybrid Encryption (Educational Prototype)')
+    print('PQ support:', 'enabled' if HAVE_OQS else 'not available')
+    choice = input('Encrypt or Decrypt? (e/d): ').strip().lower()
+    if choice not in {'e','d'}:
+        print('Invalid choice.')
+        return
+    password = input('Enter password: ')
+    nc = NovaCrypt(password)
+    use_pq = False
+    if choice == 'e' and HAVE_OQS:
+        use_pq = prompt_bool('Attempt to include Kyber768 hybrid component?', default=True)
+
+    mode = input('(m)essage or (f)ile? ').strip().lower()
+    if mode == 'm':
+        if choice == 'e':
+            message = input('Enter message: ')
+            blob = nc.encrypt(message, use_pq=use_pq)
+            print('\nEncrypted (Base64 envelope):')
+            print(blob)
+            with open('encrypted_message.txt','w') as f:
+                f.write(blob)
+            print("Saved to encrypted_message.txt")
+        else:
+            src = input('Paste encrypted Base64 (or press Enter to read encrypted_message.txt): ').strip()
+            if not src:
+                try:
+                    with open('encrypted_message.txt','r') as f:
+                        src = f.read().strip()
+                except FileNotFoundError:
+                    print('encrypted_message.txt not found.')
+                    return
+            try:
+                plaintext = nc.decrypt(src)
+                print('\nDecrypted message:')
+                print(plaintext)
+            except Exception as e:
+                print('Decryption failed:', e)
+    elif mode == 'f':
+        if choice == 'e':
+            in_path = input('Input file path: ').strip()
+            if not os.path.isfile(in_path):
+                print('File not found.')
+                return
+            out_path = input(f'Output (default {in_path}.enc): ').strip() or f'{in_path}.enc'
+            with open(in_path,'rb') as f:
+                data = f.read()
+            blob = nc.encrypt_bytes(data, use_pq=use_pq)
+            with open(out_path,'w') as f:
+                f.write(blob)
+            print(f'Encrypted -> {out_path}')
+        else:
+            in_path = input('Encrypted file path: ').strip()
+            if not os.path.isfile(in_path):
+                print('File not found.')
+                return
+            out_path = input('Decrypted output file path: ').strip() or 'decrypted.out'
+            with open(in_path,'r') as f:
+                blob = f.read()
+            try:
+                data = nc.decrypt_bytes(blob)
+            except Exception as e:
+                print('Decryption failed:', e)
+                return
+            with open(out_path,'wb') as f:
+                f.write(data)
+            print(f'Decrypted -> {out_path}')
+    else:
+        print('Invalid mode.')
+
+if __name__ == '__main__':
+    run_cli()
